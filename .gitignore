@@ -1,0 +1,20 @@
+# Secrets - never commit
+.env
+
+# Claude Code local (per-user) settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Exp 4 external memory (regenerated at runtime)
+data/memory/
