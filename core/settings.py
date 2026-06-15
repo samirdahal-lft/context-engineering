@@ -63,8 +63,8 @@ class Settings(BaseSettings):
     # --- load_document tool: per-document truncation ---
     max_document_words: int = 12_000
 
-    # --- Exp 5 multi-agent: model ids + output cap ---
-    # Sonnet 4.6 confirmed ACTIVE on this account (2026-06-10). Exp 1–4 use Haiku.
+    # --- Exp 4 multi-agent: model ids + output cap ---
+    # Sonnet 4.6 confirmed ACTIVE on this account (2026-06-10). Exp 1–3 use Haiku.
     orchestrator_model_id: str = "us.anthropic.claude-sonnet-4-6"
     subagent_model_id: str     = "us.anthropic.claude-sonnet-4-6"
     # Sub-agents return ~300-word summaries; 1200 gives room for Sonnet's preamble
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     # room or that turn gets truncated -> MaxTokensReachedException.
     orchestrator_output_tokens: int = 4000
 
-    # --- Exp 3 compaction (a small DEMO window so overflow is fast + visible,
+    # --- Exp 2 compaction (a small DEMO window so overflow is fast + visible,
     # NOT a real 200k window). All real token counts still come from the API. ---
     compaction_window_tokens: int = 6000     # the demo context ceiling
     compaction_threshold: float = 0.8        # compact at 80% full

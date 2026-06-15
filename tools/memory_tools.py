@@ -1,7 +1,7 @@
 """
 tools/memory_tools.py
 
-Strands @tool wrappers that give an agent an EXTERNAL memory for Experiment 4.
+Strands @tool wrappers that give an agent an EXTERNAL memory for Experiment 3.
 These are thin: all structure/persistence lives in the framework-agnostic
 memory/store.py. The docstrings are the "labels" the model reads to decide when
 to call each tool.

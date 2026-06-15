@@ -1,164 +1,182 @@
 """
 experiments/exp03.py
 
-Clean, importable logic for Experiment 3 (Compaction), extracted from
-notebooks/exp03_compaction.ipynb.
+Clean, importable logic for Experiment 3 (External Memory / Structured
+Note-Taking), extracted from notebooks/exp03_external_memory.ipynb.
 
 PURE PYTHON ONLY: no notebook code, no plotting, no prints.
 
-ONE pipeline, policy-driven: both arms call _run_loop with a different
-ContextPolicy -- only `compaction_enabled` differs.
+The idea: run a research task as TWO separate agent sessions with a HARD RESET
+between them (a brand-new agent = a real session boundary, since LLMs are
+stateless). Both arms differ only by whether the memory tools are enabled:
 
-    run_naive(n_papers)       -> dict   (history grows until the window overflows)
-    run_engineered(n_papers)  -> dict   (compact at threshold -> the sawtooth)
+    run_naive()       -> dict   session 2 has no access to session 1's work
+    run_engineered()  -> dict   session 1 writes notes; session 2 reads them
 
-Method (running-synthesis task):
-  1. Read papers one at a time; after each, update a running theme list.
-  2. Naive: keep appending; once real input tokens cross the window, the task
-     dies (overflow).
-  3. Engineered: when tokens cross the threshold, summarize the history
-     (recall-first via core.compaction) and reset -- so the loop survives and
-     completes.
+For the engineered arm, the final brief is synthesized DIRECTLY from the
+structured notes (data/memory/notes.json) -- that durable, human-inspectable
+artifact is the payoff of note-taking (research doc Section 8.2), and it is what
+survives the reset. The naive arm has no notes, so it cannot recover session 1.
 
-Every value in `tokens_per_iter` is the REAL `usage.inputTokens` from the
-Converse call -- that growing-then-dropping curve IS the experiment. The window
-and threshold are small demo numbers (from settings) so overflow is fast and
-visible.
+`papers_covered` is a real check on the real brief text (regex on each paper's
+signature theme). Nothing is hardcoded.
 """
 
-import json
-import time
+import re
 from typing import Any
 
-from core.compaction import CompactionService
-from core.context_models import ContextPolicy
+from core.events import OnEvent, emitter, strands_tool_callback
 from core.settings import settings
-from tools.load_document import load_document
+from memory.store import read_notes, reset_memory, write_note
 
-# The running-synthesis task (kept in `system` so each turn alternates
-# user(paper)/assistant(themes), as the Converse API requires).
-TASK = (
-    "Read each paper in turn. After each, update a running list of the key "
-    "themes across all papers read so far. Output ONLY the theme list."
-)
+# Two papers per session; the reset happens between them.
+SESSION_1_PAPERS = ["2307.03172", "2404.06654"]   # Lost in the Middle, RULER
+SESSION_2_PAPERS = ["2005.11401", "2311.05232"]   # RAG, Hallucination
+ALL_PAPERS = SESSION_1_PAPERS + SESSION_2_PAPERS
+TASK = "Build a research brief on long-context and retrieval techniques."
 
-_INDEX = json.loads(settings.index_path.read_text(encoding="utf-8"))
-_COMPACTOR = CompactionService()
+# A paper is "covered" if the brief mentions its signature theme (real check).
+_COVERAGE_KW = {
+    "2307.03172": r"lost in the middle|u-shaped|positional",
+    "2404.06654": r"\bruler\b|effective context",
+    "2005.11401": r"retrieval-augmented|retrieval augmented|\brag\b",
+    "2311.05232": r"hallucinat",
+}
+
+
+def papers_covered(brief: str) -> list[str]:
+    """Return the ids of papers whose signature theme appears in the brief."""
+    low = brief.lower()
+    return [pid for pid, pat in _COVERAGE_KW.items() if re.search(pat, low)]
 
 
 # --------------------------------------------------------------------------- #
-# message + bedrock helpers
+# session + synthesis helpers (Strands imports kept local to call time)
 # --------------------------------------------------------------------------- #
-def _user(text: str) -> dict:
-    return {"role": "user", "content": [{"text": text}]}
+def _run_session(system_prompt: str, user_prompt: str, tools: list,
+                 callback_handler=None) -> str:
+    """One isolated session: a brand-new agent with no prior context."""
+    from strands import Agent
+    from strands.models import BedrockModel
+
+    model = BedrockModel(
+        model_id=settings.bedrock_model_id,
+        region_name=settings.aws_region,
+        temperature=settings.temperature,
+        max_tokens=settings.output_max_tokens,
+    )
+    agent = Agent(model=model, tools=tools, system_prompt=system_prompt,
+                  callback_handler=callback_handler)
+    result = agent(user_prompt)
+    return "".join(
+        b.get("text", "") for b in result.message.get("content", []) if "text" in b
+    )
 
 
-def _assistant(text: str) -> dict:
-    return {"role": "assistant", "content": [{"text": text}]}
+def _synthesize_brief(notes: dict) -> str:
+    """Write the final brief straight from the structured notes (no tools).
 
-
-def _messages_text(messages: list[dict]) -> str:
-    return " ".join(b["text"] for m in messages for b in m["content"])
-
-
-def _bedrock_client():
+    Grounding the synthesis in the saved findings makes coverage reliable and is
+    the whole point of structured note-taking: the durable artifact drives the
+    output instead of the model re-deriving it from a tool result.
+    """
     import boto3
 
-    return boto3.client("bedrock-runtime", region_name=settings.aws_region)
-
-
-def _ask(system: str, messages: list[dict], max_out: int) -> tuple[str, int]:
-    """One Converse call. Returns (answer, REAL input tokens)."""
-    resp = _bedrock_client().converse(
-        modelId=settings.bedrock_model_id,
-        system=[{"text": system}],
-        messages=messages,
-        inferenceConfig={"maxTokens": max_out, "temperature": settings.temperature},
+    bullets = "\n".join(
+        f"- {p['title']} ({p['id']}): {p['finding']}" for p in notes.get("papers_processed", [])
     )
-    return resp["output"]["message"]["content"][0]["text"], resp["usage"]["inputTokens"]
-
-
-def _summarize(instruction: str, user_text: str) -> str:
-    """Summarizer injected into CompactionService (keeps core/ framework-agnostic)."""
-    summary, _ = _ask(instruction, [_user(user_text)], settings.summary_output_tokens)
-    return summary
-
-
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Keep roughly the first `max_tokens` worth of words (per-paper feed cap)."""
-    max_words = max(1, int(max_tokens / settings.tokens_per_word))
-    words = text.split()
-    if len(words) <= max_words:
-        return text
-    return " ".join(words[:max_words]) + " [...]"
-
-
-# --------------------------------------------------------------------------- #
-# the single policy-driven loop
-# --------------------------------------------------------------------------- #
-def _run_loop(n_papers: int, policy: ContextPolicy) -> dict[str, Any]:
-    """The one loop both arms share; behaviour comes entirely from `policy`."""
-    papers = _INDEX[:n_papers]
-    messages: list[dict] = []
-    tokens_per_iter: list[int] = []
-    compaction_events: list[int] = []
-    overflowed = False
-    last_answer = ""
-
-    for i, paper in enumerate(papers, start=1):
-        text = _truncate_to_tokens(load_document(paper["id"]), settings.per_paper_tokens)
-        messages.append(_user(f"Paper {paper['id']}:\n{text}\n\nUpdate the running theme list."))
-        answer, in_tokens = _ask(TASK, messages, settings.loop_output_tokens)
-        messages.append(_assistant(answer))
-
-        tokens_per_iter.append(in_tokens)
-        last_answer = answer
-
-        # Naive: no budget -- once we cross the window, the task dies.
-        if not policy.compaction_enabled and in_tokens > policy.max_tokens:
-            overflowed = True
-            break
-
-        # Engineered: compact + reset before the window fills.
-        if _COMPACTOR.should_compact(in_tokens, policy):
-            summary = _COMPACTOR.compact(TASK, _messages_text(messages), _summarize)
-            messages = [
-                _user(f"Summary so far [history compacted]:\n{summary}"),
-                _assistant("Understood. Continuing the task."),
-            ]
-            compaction_events.append(i)
-
-    return {
-        "completed": not overflowed,
-        "overflowed": overflowed,
-        "final_answer": last_answer,
-        "tokens_per_iter": tokens_per_iter,
-        "compaction_events": compaction_events,
-        "papers_processed": len(tokens_per_iter),
-        "window_tokens": policy.max_tokens,
-    }
+    prompt = (
+        "Write a final research brief from these saved findings. Include one short "
+        f"titled section per finding, naming each paper.\n\n{bullets}"
+    )
+    client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+    resp = client.converse(
+        modelId=settings.bedrock_model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={
+            "maxTokens": settings.output_max_tokens,
+            "temperature": settings.temperature,
+        },
+    )
+    return resp["output"]["message"]["content"][0]["text"]
 
 
 # --------------------------------------------------------------------------- #
 # public arms
 # --------------------------------------------------------------------------- #
-def _policy(compaction_enabled: bool) -> ContextPolicy:
-    return ContextPolicy(
-        mode="engineered",
-        max_tokens=settings.compaction_window_tokens,
-        compaction_enabled=compaction_enabled,
-        compaction_threshold=settings.compaction_threshold,
+def run_naive(on_event: OnEvent = None) -> dict[str, Any]:
+    """Two isolated sessions, no shared memory: session 2 loses session 1's work."""
+    from tools.load_document import load_document
+
+    emit = emitter(on_event)
+    cb = strands_tool_callback(emit) if on_event is not None else None
+
+    # Session 1: draft a partial brief (discarded -- nothing persists).
+    emit("log", text="🅰️ Session 1: reading papers, drafting a brief (will be discarded)…")
+    _run_session(
+        "You are a research assistant. Read the papers and draft a brief.",
+        f"{TASK} Read these papers with load_document: {SESSION_1_PAPERS}. "
+        "Draft a partial brief.",
+        tools=[load_document],
+        callback_handler=cb,
     )
+    # --- HARD RESET: a brand-new agent runs below, with no carried-over context.
+    emit("log", text="♻️ HARD RESET — brand-new agent, nothing carried over")
+    emit("log", text="🅱️ Session 2: final brief, with NO memory of session 1…")
+    brief = _run_session(
+        "You are a research assistant. Produce the FINAL combined research brief.",
+        f"{TASK} Read these papers with load_document: {SESSION_2_PAPERS}. "
+        "Produce the FINAL brief covering all papers you have read.",
+        tools=[load_document],
+        callback_handler=cb,
+    )
+    covered = papers_covered(brief)
+    emit("metric", label="Papers covered", value=f"{len(covered)}/4")
+    return {"final_brief": brief, "papers_covered": covered}
 
 
-def run_naive(n_papers: int = len(_INDEX)) -> dict[str, Any]:
-    """History grows unbounded -- crosses the window and the task dies."""
-    return _run_loop(n_papers, _policy(compaction_enabled=False))
+def run_engineered(on_event: OnEvent = None) -> dict[str, Any]:
+    """Two sessions sharing external notes: session 2 reads them and resumes."""
+    from tools.load_document import load_document
+    from tools.memory_tools import read_progress, save_finding
+
+    emit = emitter(on_event)
+    cb = strands_tool_callback(emit) if on_event is not None else None
+
+    reset_memory()
+    write_note("task", TASK)   # record the task in external memory before findings
+    # Session 1: read each paper and SAVE each finding to external memory.
+    emit("log", text="🅰️ Session 1: reading papers + save_finding to notes.json…")
+    _run_session(
+        "You are a research assistant. After reading EACH paper, call save_finding "
+        "to record its key contribution to external memory.",
+        f"{TASK} Read these papers with load_document: {SESSION_1_PAPERS}. "
+        "Call save_finding once per paper.",
+        tools=[load_document, save_finding],
+        callback_handler=cb,
+    )
+    # --- HARD RESET: new agent, no in-context memory.
+    # Session 2: recover prior notes, read new papers, SAVE their findings too.
+    emit("log", text="♻️ HARD RESET — new agent; state survives ONLY on disk")
+    emit("log", text="🅱️ Session 2: read_progress to recover notes, then continue…")
+    _run_session(
+        "You are resuming earlier work. FIRST call read_progress to recover prior "
+        "findings, THEN read each new paper and call save_finding for it.",
+        f"{TASK} First call read_progress. Then read these with load_document: "
+        f"{SESSION_2_PAPERS}. Call save_finding once per new paper.",
+        tools=[load_document, read_progress, save_finding],
+        callback_handler=cb,
+    )
+    emit("log", text="🧩 Synthesizing the final brief straight from notes.json…")
+    notes = read_notes()              # external memory now holds ALL findings
+    brief = _synthesize_brief(notes)  # final brief grounded in that memory
+    covered = papers_covered(brief)
+    emit("metric", label="Papers covered", value=f"{len(covered)}/4")
+    return {
+        "final_brief": brief,
+        "papers_covered": covered,
+        "notes_snapshot": notes,
+    }
 
 
-def run_engineered(n_papers: int = len(_INDEX)) -> dict[str, Any]:
-    """Compact at the threshold -> the sawtooth -> the task completes."""
-    return _run_loop(n_papers, _policy(compaction_enabled=True))
-
-
-__all__ = ["run_naive", "run_engineered", "TASK"]
+__all__ = ["run_naive", "run_engineered", "papers_covered", "TASK"]

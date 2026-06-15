@@ -1,7 +1,7 @@
 """
 agents/subagents.py
 
-Specialist sub-agents for Experiment 5 (Multi-Agent vs Single-Agent), exposed
+Specialist sub-agents for Experiment 4 (Multi-Agent vs Single-Agent), exposed
 via Strands' Agents-as-Tools pattern: each is an @tool-decorated function that
 builds its OWN Agent (own context window), does its verbose work in isolation,
 and returns only a short summary string.

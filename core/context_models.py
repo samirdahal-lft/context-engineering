@@ -21,27 +21,24 @@ class ContextPolicy(BaseModel):
     """The switch that decides HOW we build context.
 
     Experiment 1 used `mode` to pick load_everything vs progressive.
-    Experiment 2 adds budgeting knobs used by the engineered agent loop:
-    how big any single tool output may be, and whether old tool outputs get
-    wiped so the context stays lean across loop iterations.
+    Experiment 2 (Compaction) reuses `max_tokens` as the context-window ceiling and
+    adds two knobs: whether to compact at all, and the fill fraction at which
+    compaction fires.
 
-      naive       = keep everything raw, no budget (context grows forever)
-      engineered  = truncate each tool output + clear old ones + cap total
-
-    Experiment 3 (Compaction) reuses `max_tokens` as the context-window ceiling
-    and adds two knobs: whether to compact at all, and the fill fraction at
-    which compaction fires.
+    The `truncate_tool_output_to` / `clear_old_tool_results` knobs below are legacy
+    from the removed Context Rot experiment (truncate + clear old tool outputs);
+    they're kept so the whole lab shares one policy type, but no active experiment
+    uses them.
     """
-    # Exp 1 modes still valid; Exp 2 adds naive/engineered. Kept permissive so
-    # all experiments share one policy type.
+    # `mode` kept permissive so all experiments can share one policy type.
     mode: Literal["load_everything", "progressive", "naive", "engineered"] = "engineered"
 
-    # --- Exp 2 budgeting knobs (engineered arm only) ---
-    max_tokens: int = 8000                       # budget / window ceiling (engineered only)
+    # --- budgeting knobs (legacy: the removed Context Rot experiment) ---
+    max_tokens: int = 8000                       # budget / window ceiling
     truncate_tool_output_to: int | None = 1500   # cap per tool output, in tokens
     clear_old_tool_results: bool = True          # replace old raw tool outputs with a stub
 
-    # --- Exp 3 compaction knobs (engineered arm only) ---
+    # --- Exp 2 compaction knobs (engineered arm only) ---
     compaction_enabled: bool = True              # summarize + reset history near the limit
     compaction_threshold: float = 0.8            # compact when tokens > threshold * max_tokens
 

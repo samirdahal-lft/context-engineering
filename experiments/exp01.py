@@ -1,7 +1,7 @@
 """
 experiments/exp01.py
 
-Clean, importable logic for Experiment 1 (JIT Retrieval vs Load-Everything),
+Clean, importable logic for Experiment 1 (Just-in-Time Retrieval vs Load-Everything),
 extracted from the notebook.
 
 PURE PYTHON ONLY: no Streamlit, no notebook code, no prints, no pandas.
@@ -25,6 +25,7 @@ import json
 import time
 from typing import Any
 
+from core.events import OnEvent, emitter, strands_tool_callback
 from core.settings import settings
 from core.tokenizer import count_tokens
 
@@ -124,20 +125,29 @@ def _answer_with_fit(words: list[str], question: str) -> tuple[dict, bool]:
             raise
 
 
-def run_naive(question: str) -> dict[str, Any]:
+def run_naive(question: str, on_event: OnEvent = None) -> dict[str, Any]:
     """Glue all papers into one prompt and answer in a single Bedrock call.
 
     Returns: answer, input_tokens, output_tokens, latency, breakdown, truncated,
              facts_found (bool if question is in evals, else None).
     """
+    emit = emitter(on_event)
+    emit("log", text=f"📚 Loading all {len(INDEX)} papers into one prompt…")
     blob, breakdown = _build_corpus_blob()
 
+    emit("log", text="🛰️ Sending the whole corpus to the model…")
     start = time.time()
     response, truncated = _answer_with_fit(blob.split(), question)
     latency = time.time() - start
 
     answer = _converse_answer(response)
     usage = response["usage"]
+    if truncated:
+        emit("log", text="⚠️ Too big to fit — dropped some papers to fit the window")
+    emit("metric", label="Input tokens", value=f"{usage['inputTokens']:,}")
+    emit("metric", label="Latency", value=f"{latency:.1f}s")
+    emit("log", text="✅ Answered in one shot")
+    emit("answer", text=answer)
     eval_entry = _eval_for_question(question)
     return {
         "answer": answer,
@@ -151,7 +161,7 @@ def run_naive(question: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Arm 2 -- Progressive disclosure
+# Arm 2 -- Just-in-Time retrieval
 # --------------------------------------------------------------------------- #
 def _build_index_prompt() -> str:
     lines = "".join(
@@ -204,7 +214,7 @@ def _progressive_steps(index_prompt: str, doc_ids: list[str]) -> list[str]:
     return steps
 
 
-def _build_agent():
+def _build_agent(callback_handler=None):
     """Construct the progressive Strands agent (imports kept local)."""
     from strands import Agent
     from strands.models import BedrockModel
@@ -218,17 +228,22 @@ def _build_agent():
     )
     index_prompt = _build_index_prompt()
     system_prompt = _build_system_prompt(index_prompt)
-    agent = Agent(model=model, tools=[load_document], system_prompt=system_prompt)
+    agent = Agent(model=model, tools=[load_document], system_prompt=system_prompt,
+                  callback_handler=callback_handler)
     return agent, index_prompt, system_prompt
 
 
-def run_progressive(question: str) -> dict[str, Any]:
+def run_progressive(question: str, on_event: OnEvent = None) -> dict[str, Any]:
     """Agent sees only a lightweight index, then loads the ONE relevant paper.
 
     Returns: answer, total_tokens, latency, doc_loaded, breakdown, steps,
              facts_found (bool if question is in evals, else None).
     """
-    agent, index_prompt, system_prompt = _build_agent()
+    emit = emitter(on_event)
+    emit("log", text="📋 Reading the lightweight index…")
+    # Stream a live "🔧 load_document" line as the agent fires the tool.
+    callback = strands_tool_callback(emit) if on_event is not None else None
+    agent, index_prompt, system_prompt = _build_agent(callback)
 
     start = time.time()
     result = agent(question)
@@ -236,11 +251,18 @@ def run_progressive(question: str) -> dict[str, Any]:
 
     doc_ids = _loaded_doc_ids(agent)
     doc_loaded = doc_ids[0] if doc_ids else "NONE"
+    if doc_loaded != "NONE":
+        emit("log", text=f"📄 Loaded only {doc_loaded}")
     answer = _message_text(result.message)
+    total = result.metrics.accumulated_usage["inputTokens"]
+    emit("metric", label="Total tokens", value=f"{total:,}")
+    emit("metric", label="Latency", value=f"{latency:.1f}s")
+    emit("log", text="✅ Answered with a citation")
+    emit("answer", text=answer)
     eval_entry = _eval_for_question(question)
     return {
         "answer": answer,
-        "total_tokens": result.metrics.accumulated_usage["inputTokens"],
+        "total_tokens": total,
         "latency": latency,
         "doc_loaded": doc_loaded,
         "breakdown": _progressive_breakdown(system_prompt, question, doc_loaded),

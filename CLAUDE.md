@@ -10,14 +10,14 @@ to work and the conventions every experiment follows.
 An interactive **Context Engineering Lab**: a Streamlit platform where each
 experiment shows a context-engineering *problem* (naive arm) and its *fix*
 (engineered arm), measured with **real** AWS Bedrock (Claude) calls.
-5 experiments are built (1–5):
+4 experiments are built (1–4). (Context Rot was removed — its recall-failure effect
+didn't reproduce with real models — so the rest were renumbered to close the gap.)
 
-- **Exp 1 — JIT Retrieval / Progressive Disclosure** (load-everything vs index + `load_document`)
-- **Exp 2 — Context Rot** (truncate + clear tool outputs across an agent loop)
-- **Exp 3 — Compaction** (summarize history at a threshold → the sawtooth)
-- **Exp 4 — External Memory** (note-taking to `data/memory/notes.json` that
+- **Exp 1 — Just-in-Time Retrieval** (load-everything vs index + `load_document`)
+- **Exp 2 — Compaction** (summarize history at a threshold → the sawtooth)
+- **Exp 3 — External Memory** (note-taking to `data/memory/notes.json` that
   survives a full session reset; two sessions, naive ≈ 2 papers vs engineered 4)
-- **Exp 5 — Multi-Agent** (an index-driven router assigns papers to 3 isolated
+- **Exp 4 — Multi-Agent** (an index-driven router assigns papers to 3 isolated
   sub-agents by `field`, run in parallel + a composer; parent/composer context
   ~1k vs single-agent ~80k — compression by architecture. Because the specialists
   run concurrently, multi latency ≈ the slowest one, not the sum: ~29s vs the
@@ -65,12 +65,15 @@ pages/N_*.py              ← Streamlit page. Thin shell: collect input, call
 streamlit_app.py          ← landing page + multipage entry point.
 core/                     ← framework-agnostic shared code (NO strands imports).
 tools/                    ← Strands @tool functions (load_document, memory_tools).
-memory/                   ← framework-agnostic file-backed note store (Exp 4).
+memory/                   ← framework-agnostic file-backed note store (Exp 3).
                             NO strands imports; the @tools wrap it.
-agents/                   ← Strands sub-agents exposed as tools (Exp 5,
+agents/                   ← Strands sub-agents exposed as tools (Exp 4,
                             Agents-as-Tools). Builds Agents, so it MAY import strands.
+core/events.py            ← framework-agnostic event plumbing for the live UI logs.
+app_ui.py                 ← Streamlit "mission control" UI kit (theme CSS, headers,
+                            metric chips, LiveLog, stream_run). View layer, NOT in core/.
 data/corpus/ + index.json ← the 7 arXiv papers + lightweight index (reused).
-data/memory/notes.json    ← Exp 4 external memory (gitignored; regenerated at run).
+data/memory/notes.json    ← Exp 3 external memory (gitignored; regenerated at run).
 ```
 
 **Reuse, don't rebuild.** New experiments reuse `core/tokenizer.py`,
@@ -128,17 +131,20 @@ from earlier experiments.
   if calls start failing with auth errors, the creds need refreshing.
 - **Model:** `us.anthropic.claude-3-5-haiku-20241022-v1:0` (set in `.env` as
   `BEDROCK_MODEL_ID`). Newer Sonnet models aren't enabled on this account.
-- **`CountTokens` is NOT supported by Claude 3 models** → `core/tokenizer.py`
-  gracefully falls back to a `words × 1.3` estimate (with a one-time warning).
-  Exact counts come from each call's `usage.inputTokens`. Headline numbers are
-  real; the local tokenizer is only for per-segment X-ray breakdowns.
+- **`CountTokens` works for Haiku 3.5 — but only with the BASE foundation-model id**
+  (`anthropic.claude-3-5-haiku-...`), NOT the `us.`-prefixed cross-region inference
+  profile we use for Converse. `core/tokenizer.py` strips that prefix
+  (`_foundation_model_id`) and gets **exact** counts; the `words × 1.3` estimate is
+  now only a true offline fallback (no creds/network). (The earlier "Claude 3 doesn't
+  support CountTokens" belief was wrong — it was the inference-profile id all along.)
+  Headline numbers also come from each call's real `usage.inputTokens`.
 - **Claude context window = input ceiling; output (`max_tokens`) is a separate
   budget.** Academic papers run **~2 tokens/word** (not 1.3) — see
   `settings.tokens_per_word`.
 - Use the **Converse API** (`bedrock-runtime.converse`); messages must
   **alternate user/assistant** and start with user. Put task instructions in the
   `system` param when you need consecutive same-role turns.
-- **Haiku tool-use is reliable for *fetching*, flaky for *re-weaving*.** In Exp 4
+- **Haiku tool-use is reliable for *fetching*, flaky for *re-weaving*.** In Exp 3
   the agent always called `read_progress` and got the notes, but inconsistently
   folded that recovered tool-result back into a prose answer (coverage swung
   2–3/4, and a *stricter* prompt made it worse). Fix: ground the final synthesis
@@ -160,7 +166,7 @@ from earlier experiments.
   three sub-agent tools and telling it to call them, it sometimes answered the
   multi-part question from its own parametric knowledge and skipped the tools —
   a *silently invalid* run (empty sub-agent usage, a tiny "parent" context that
-  never delegated). Exp 5 therefore **orchestrates the specialists explicitly**
+  never delegated). Exp 4 therefore **orchestrates the specialists explicitly**
   (`run_all_specialists`) and feeds their summaries to a tool-less **composer**.
   Each specialist still runs in its own window, so isolation holds and the run is
   reproducible. (And always guard UI code against an empty usage list.)
@@ -182,40 +188,33 @@ from earlier experiments.
 
 ---
 
-## Known gaps — next session pick-up list
+## Current state & notes for next session
 
-These are confirmed issues found during the 2026-06-10 code-review prep session.
-Pick up from here next time. Do NOT re-derive them — they are already diagnosed.
+The 2026-06-10 "known gaps" are all resolved, and the lab was restructured on
+2026-06-11. Do NOT re-derive these:
 
-### Must-do before demo
+- **Context Rot removed + experiments renumbered to 1–4.** Its recall-failure effect
+  did not reproduce with real models (tested Haiku & Nova Micro up to ~140k tokens —
+  single-needle and multi-fact both recalled fine; earlier "rot" was a safety refusal
+  or a probe bug). So it was deleted and Compaction→2, External Memory→3, Multi-Agent→4.
+- **Live-logs frontend ("mission control").** Dark theme (`.streamlit/config.toml`),
+  shared UI kit (`app_ui.py`: `inject_css`, `experiment_header`, `metric_chips`,
+  `LiveLog`, `stream_run`), and event plumbing (`core/events.py`). Every experiment
+  arm accepts `on_event=` and narrates itself; pages stream each arm's steps live.
+- **`stream_run` is mandatory for agent pages.** Strands runs the model in a worker
+  thread, so its `callback_handler` fires off the Streamlit script thread — writing to
+  the UI there raises `NoSessionContext`. `app_ui.stream_run` runs the experiment in a
+  worker that only `queue.put`s events; the MAIN thread drains the queue and renders.
+- **CountTokens now returns EXACT counts** — `core/tokenizer.py` strips the `us.`
+  inference-profile prefix to the base model id (see the Bedrock note above). The
+  `words×1.3` path is only a true offline fallback now.
+- Already-fixed earlier: the Exp 3 (memory) KeyError guard, `facts_found` badges on
+  page 1, `import json` placement, and the `agents/subagents.py` dead code.
 
-**Exp 4 — `experiments/exp04.py` line ~83: KeyError on live demo**
-`_synthesize_brief` accesses `notes["papers_processed"]` without guarding.
-If Haiku never calls `save_finding` (tool flakiness), this raises `KeyError`
-mid-demo. Fix: `notes.get("papers_processed", [])`.
-
-**Exp 5 — `agents/subagents.py`: ~55 lines of dead code**
-`_run_specialist_tool`, `research_attention`, `research_position`,
-`research_retrieval`, and `SUBAGENT_TOOLS` are defined but never called.
-`run_all_specialists()` (the real path) uses `ThreadPoolExecutor` directly.
-These are vestiges of the abandoned "let the parent LLM call each tool" design
-(rejected because Haiku skips tools and answers from parametric knowledge).
-A reviewer seeing these tools would think the parent LLM calls them — it doesn't.
-Fix: delete all five + their `__all__` entries.
-
-### Nice-to-have
-
-**Exp 1 — `pages/1_Progressive_Disclosure.py`: `facts_found` not shown in UI**
-`experiments/exp01.py` now returns `facts_found: bool | None` from both arms.
-The page doesn't display it yet. Add `st.success("✅ ...")` / `st.error("❌ ...")`
-after each arm's answer block — ~6 lines total.
-
-**Exp 2 — `experiments/exp02.py`: silent coupling between two functions**
-`_is_doc_message()` matches the string prefix `"Loaded document"`.
-`_new_tool_output()` writes `f"Loaded document {doc_id}:\n{raw}"`.
-If the prefix in `_new_tool_output` ever changes, `_is_doc_message` silently
-stops working with no error. Add a comment on `_is_doc_message` pointing at this.
-
-**Exp 3 — `experiments/exp03.py`: `import json` is mid-file**
-`import json` appears on line 44, after the `TASK` constant, not in the import
-block at the top. Move it to the top-level import block.
+### Still open (lower priority)
+- **Exp 2 (Compaction) "recall-first" claim is unverified.** The engineered final theme
+  list appears to drop early-paper themes after compaction — the sawtooth (survival) is
+  proven, but continuity/recall is not measured. Add a coverage check if revisited.
+- **Legacy `ContextPolicy` fields** `truncate_tool_output_to` / `clear_old_tool_results`
+  are now unused (they were Context Rot's). Kept for the shared policy type; could be
+  pruned in a dedicated cleanup.

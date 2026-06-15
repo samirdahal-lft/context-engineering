@@ -1,48 +1,50 @@
 """
 experiments/exp02.py
 
-Clean, importable logic for Experiment 2 (Context Growth & Context Rot),
-extracted from notebooks/exp02_context_rot.ipynb.
+Clean, importable logic for Experiment 2 (Compaction), extracted from
+notebooks/exp02_compaction.ipynb.
 
-PURE PYTHON ONLY: no notebook code, no plotting.
+PURE PYTHON ONLY: no notebook code, no plotting, no prints.
 
 ONE pipeline, policy-driven: both arms call _run_loop with a different
-ContextPolicy -- nothing forks into unrelated code.
+ContextPolicy -- only `compaction_enabled` differs.
 
-    run_naive_loop(n_papers)       -> dict   (raw history, no budget)
-    run_engineered_loop(n_papers)  -> dict   (truncate + clear old + cap)
+    run_naive(n_papers)       -> dict   (history grows until the window overflows)
+    run_engineered(n_papers)  -> dict   (compact at threshold -> the sawtooth)
 
-Method (needle-in-growing-context):
-  1. Plant a synthetic needle fact as the first message.
-  2. Load N papers in sequence (each a large tool output appended to history).
-  3. Probe: ask the model to recall the needle.
-  4. Measure recall, tokens, latency and cost.
+Method (running-synthesis task):
+  1. Read papers one at a time; after each, update a running theme list.
+  2. Naive: keep appending; once real input tokens cross the window, the task
+     dies (overflow).
+  3. Engineered: when tokens cross the threshold, summarize the history
+     (recall-first via core.compaction) and reset -- so the loop survives and
+     completes.
 
-`final_tokens`, `output_tokens`, `latency` are REAL (from the Bedrock Converse
-call). `cost` uses published per-1M rates from settings. The per-iteration
-`tokens_per_iter` curve uses core.tokenizer (its shape -- growing vs flat -- is
-the point).
+Every value in `tokens_per_iter` is the REAL `usage.inputTokens` from the
+Converse call -- that growing-then-dropping curve IS the experiment. The window
+and threshold are small demo numbers (from settings) so overflow is fast and
+visible.
 """
 
 import json
 import time
 from typing import Any
 
+from core.compaction import CompactionService
 from core.context_models import ContextPolicy
+from core.events import OnEvent, emitter
 from core.settings import settings
-from core.tokenizer import count_tokens
 from tools.load_document import load_document
 
-# --- The needle (synthetic + fixed for reproducibility) ---
-NEEDLE = (
-    "IMPORTANT - remember this for later: the internal review code "
-    "for this session is GLASSWING-2026."
+# The running-synthesis task (kept in `system` so each turn alternates
+# user(paper)/assistant(themes), as the Converse API requires).
+TASK = (
+    "Read each paper in turn. After each, update a running list of the key "
+    "themes across all papers read so far. Output ONLY the theme list."
 )
-NEEDLE_ANSWER = "GLASSWING-2026"
-PROBE = "What is the internal review code for this session?"
-CLEARED_STUB = "[document processed - content cleared to preserve budget]"
 
 _INDEX = json.loads(settings.index_path.read_text(encoding="utf-8"))
+_COMPACTOR = CompactionService()
 
 
 # --------------------------------------------------------------------------- #
@@ -56,145 +58,113 @@ def _assistant(text: str) -> dict:
     return {"role": "assistant", "content": [{"text": text}]}
 
 
+def _messages_text(messages: list[dict]) -> str:
+    return " ".join(b["text"] for m in messages for b in m["content"])
+
+
 def _bedrock_client():
     import boto3
 
     return boto3.client("bedrock-runtime", region_name=settings.aws_region)
 
 
-def _messages_text(messages: list[dict]) -> str:
-    return " ".join(b["text"] for m in messages for b in m["content"])
-
-
-def _messages_tokens(messages: list[dict]) -> int:
-    return count_tokens(_messages_text(messages))
-
-
-def _cost_usd(input_tokens: int, output_tokens: int) -> float:
-    return (
-        input_tokens / 1e6 * settings.price_in_per_1m
-        + output_tokens / 1e6 * settings.price_out_per_1m
+def _ask(system: str, messages: list[dict], max_out: int) -> tuple[str, int]:
+    """One Converse call. Returns (answer, REAL input tokens)."""
+    resp = _bedrock_client().converse(
+        modelId=settings.bedrock_model_id,
+        system=[{"text": system}],
+        messages=messages,
+        inferenceConfig={"maxTokens": max_out, "temperature": settings.temperature},
     )
+    return resp["output"]["message"]["content"][0]["text"], resp["usage"]["inputTokens"]
 
 
-# --------------------------------------------------------------------------- #
-# policy operations (truncate / clear / cap)
-# --------------------------------------------------------------------------- #
+def _summarize(instruction: str, user_text: str) -> str:
+    """Summarizer injected into CompactionService (keeps core/ framework-agnostic)."""
+    summary, _ = _ask(instruction, [_user(user_text)], settings.summary_output_tokens)
+    return summary
+
+
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Keep roughly the first `max_tokens` worth of words."""
+    """Keep roughly the first `max_tokens` worth of words (per-paper feed cap)."""
     max_words = max(1, int(max_tokens / settings.tokens_per_word))
     words = text.split()
     if len(words) <= max_words:
         return text
-    return " ".join(words[:max_words]) + "\n[...truncated...]"
-
-
-def _new_tool_output(doc_id: str, policy: ContextPolicy) -> str:
-    """Load a paper, optionally truncating it per the tool-output cap."""
-    raw = load_document(doc_id)
-    if policy.truncate_tool_output_to is not None:
-        raw = _truncate_to_tokens(raw, policy.truncate_tool_output_to)
-    return f"Loaded document {doc_id}:\n{raw}"
-
-
-def _is_doc_message(message: dict) -> bool:
-    text = message["content"][0]["text"]
-    return message["role"] == "user" and text.startswith("Loaded document")
-
-
-def _clear_old_docs(messages: list[dict]) -> None:
-    """Replace every doc message except the most recent with a stub."""
-    doc_idxs = [i for i, m in enumerate(messages) if _is_doc_message(m)]
-    for idx in doc_idxs[:-1]:
-        messages[idx] = _user(CLEARED_STUB)
-
-
-def _enforce_budget(messages: list[dict], policy: ContextPolicy) -> None:
-    """Last-resort cap: shrink the most recent doc until under max_tokens."""
-    while _messages_tokens(messages) > policy.max_tokens:
-        doc_idxs = [i for i, m in enumerate(messages) if _is_doc_message(m)]
-        if not doc_idxs:
-            break
-        idx = doc_idxs[-1]
-        words = messages[idx]["content"][0]["text"].split()
-        if len(words) <= 50:
-            break
-        messages[idx] = _user(" ".join(words[: len(words) // 2]) + "\n[...truncated...]")
+    return " ".join(words[:max_words]) + " [...]"
 
 
 # --------------------------------------------------------------------------- #
 # the single policy-driven loop
 # --------------------------------------------------------------------------- #
-def _probe(messages: list[dict]) -> tuple[str, dict, float]:
-    """Append the probe, call the model, return (answer, usage, latency)."""
-    messages.append(_user(PROBE))
-    start = time.time()
-    resp = _bedrock_client().converse(
-        modelId=settings.bedrock_model_id,
-        messages=messages,
-        inferenceConfig={"maxTokens": 200, "temperature": settings.temperature},
-    )
-    latency = time.time() - start
-    answer = resp["output"]["message"]["content"][0]["text"]
-    return answer, resp["usage"], latency
-
-
-def _run_loop(n_papers: int, policy: ContextPolicy) -> dict[str, Any]:
+def _run_loop(n_papers: int, policy: ContextPolicy, on_event: OnEvent = None) -> dict[str, Any]:
     """The one loop both arms share; behaviour comes entirely from `policy`."""
-    messages: list[dict] = [_user(NEEDLE), _assistant("Acknowledged.")]
-    doc_ids = [p["id"] for p in _INDEX[:n_papers]]
-
+    emit = emitter(on_event)
+    papers = _INDEX[:n_papers]
+    messages: list[dict] = []
     tokens_per_iter: list[int] = []
-    steps: list[dict] = []
-    for i, doc_id in enumerate(doc_ids, start=1):
-        messages.append(_user(_new_tool_output(doc_id, policy)))
-        messages.append(_assistant(f"Loaded {doc_id}."))
+    compaction_events: list[int] = []
+    overflowed = False
+    last_answer = ""
 
-        if policy.clear_old_tool_results:
-            _clear_old_docs(messages)
-        _enforce_budget(messages, policy)
+    for i, paper in enumerate(papers, start=1):
+        text = _truncate_to_tokens(load_document(paper["id"]), settings.per_paper_tokens)
+        messages.append(_user(f"Paper {paper['id']}:\n{text}\n\nUpdate the running theme list."))
+        answer, in_tokens = _ask(TASK, messages, settings.loop_output_tokens)
+        messages.append(_assistant(answer))
 
-        total = _messages_tokens(messages)
-        tokens_per_iter.append(total)
-        steps.append(
-            {
-                "iteration": i,
-                "total_tokens": total,
-                "needle_present": NEEDLE_ANSWER in _messages_text(messages),
-            }
-        )
+        tokens_per_iter.append(in_tokens)
+        last_answer = answer
+        emit("log", text=f"📄 Paper {i}/{n_papers}: {paper['id']} — {in_tokens:,} tok")
 
-    answer, usage, latency = _probe(messages)
+        # Naive: no budget -- once we cross the window, the task dies.
+        if not policy.compaction_enabled and in_tokens > policy.max_tokens:
+            overflowed = True
+            emit("log", text=f"💥 Overflow! {in_tokens:,} > {policy.max_tokens:,} window — task dies")
+            break
+
+        # Engineered: compact + reset before the window fills.
+        if _COMPACTOR.should_compact(in_tokens, policy):
+            summary = _COMPACTOR.compact(TASK, _messages_text(messages), _summarize)
+            messages = [
+                _user(f"Summary so far [history compacted]:\n{summary}"),
+                _assistant("Understood. Continuing the task."),
+            ]
+            compaction_events.append(i)
+            emit("log", text=f"⚡ Compaction fired after paper {i} — history summarized, context reset")
+
+    emit("metric", label="Papers processed", value=len(tokens_per_iter))
     return {
-        "answer": answer,
-        "needle_recalled": NEEDLE_ANSWER.lower() in answer.lower(),
+        "completed": not overflowed,
+        "overflowed": overflowed,
+        "final_answer": last_answer,
         "tokens_per_iter": tokens_per_iter,
-        "final_tokens": usage["inputTokens"],
-        "output_tokens": usage["outputTokens"],
-        "latency": latency,
-        "cost": _cost_usd(usage["inputTokens"], usage["outputTokens"]),
-        "steps": steps,
+        "compaction_events": compaction_events,
+        "papers_processed": len(tokens_per_iter),
+        "window_tokens": policy.max_tokens,
     }
 
 
 # --------------------------------------------------------------------------- #
 # public arms
 # --------------------------------------------------------------------------- #
-def run_naive_loop(n_papers: int) -> dict[str, Any]:
-    """Unbounded history: raw tool outputs, no truncation, no clearing."""
-    policy = ContextPolicy(
-        mode="naive",
-        truncate_tool_output_to=None,
-        clear_old_tool_results=False,
-        max_tokens=10**9,  # effectively no cap
+def _policy(compaction_enabled: bool) -> ContextPolicy:
+    return ContextPolicy(
+        mode="engineered",
+        max_tokens=settings.compaction_window_tokens,
+        compaction_enabled=compaction_enabled,
+        compaction_threshold=settings.compaction_threshold,
     )
-    return _run_loop(n_papers, policy)
 
 
-def run_engineered_loop(n_papers: int) -> dict[str, Any]:
-    """Budgeted history: truncate each tool output, clear old ones, cap total."""
-    policy = ContextPolicy(mode="engineered")  # truncate=1500, clear=True, cap=8000
-    return _run_loop(n_papers, policy)
+def run_naive(n_papers: int = len(_INDEX), on_event: OnEvent = None) -> dict[str, Any]:
+    """History grows unbounded -- crosses the window and the task dies."""
+    return _run_loop(n_papers, _policy(compaction_enabled=False), on_event)
 
 
-__all__ = ["run_naive_loop", "run_engineered_loop", "NEEDLE", "NEEDLE_ANSWER", "PROBE"]
+def run_engineered(n_papers: int = len(_INDEX), on_event: OnEvent = None) -> dict[str, Any]:
+    """Compact at the threshold -> the sawtooth -> the task completes."""
+    return _run_loop(n_papers, _policy(compaction_enabled=True), on_event)
+
+
+__all__ = ["run_naive", "run_engineered", "TASK"]

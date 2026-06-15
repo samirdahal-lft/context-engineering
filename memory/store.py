@@ -2,7 +2,7 @@
 memory/store.py
 
 A tiny, file-based, human-inspectable note store -- the "external memory" for
-Experiment 4. State lives OUTSIDE the context window (in data/memory/notes.json)
+Experiment 3. State lives OUTSIDE the context window (in data/memory/notes.json)
 so it survives a complete session reset.
 
 FRAMEWORK-AGNOSTIC: no Strands, no Streamlit imports here. The Strands @tool

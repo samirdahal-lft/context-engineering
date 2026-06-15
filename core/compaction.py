@@ -1,7 +1,7 @@
 """
 core/compaction.py
 
-Framework-agnostic compaction logic for Experiment 3.
+Framework-agnostic compaction logic for Experiment 2.
 
 "Compaction" = when the running history nears the context window, summarize it
 (MAXIMIZE RECALL FIRST, then precision), then REPLACE the raw history with that

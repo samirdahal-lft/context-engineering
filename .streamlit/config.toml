@@ -1,0 +1,9 @@
+# Dark "mission control" theme for the Context Engineering Lab.
+# Applies app-wide; per-page polish is layered on via app_ui.inject_css().
+[theme]
+base = "dark"
+primaryColor = "#00E0C6"             # bright teal accent
+backgroundColor = "#0B0E14"          # near-black page
+secondaryBackgroundColor = "#151A23" # panels / sidebar
+textColor = "#E6EAF0"
+font = "sans serif"

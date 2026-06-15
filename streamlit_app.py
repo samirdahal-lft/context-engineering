@@ -11,14 +11,17 @@ import path, so every page under pages/ can import experiments/, core/, tools/.
 
 import streamlit as st
 
-st.set_page_config(page_title="Context Engineering Lab", layout="wide")
+from app_ui import inject_css
 
-st.title("Context Engineering Lab")
+st.set_page_config(page_title="Context Engineering Lab", layout="wide")
+inject_css()
+
 st.markdown(
-    """
-> *"Context engineering is curating what the model sees so that you get a better result."*
-> — Birgitta Böckeler, Thoughtworks, 2026
-"""
+    "<div class='exp-hero'><div class='exp-badge'>CE</div>"
+    "<h1>Context Engineering Lab</h1></div>"
+    "<p class='exp-sub'><em>“Context engineering is curating what the model sees so "
+    "that you get a better result.”</em> — Birgitta Böckeler, Thoughtworks, 2026</p>",
+    unsafe_allow_html=True,
 )
 
 st.divider()
@@ -34,13 +37,14 @@ engineering is the discipline of deciding **what goes in that window, in what or
 and when to clear or compress it**.
 
 Poor context management leads to bloated costs, degraded accuracy, and tasks that
-crash mid-run. The experiments below each isolate one failure mode and show the fix —
-measured with **real AWS Bedrock calls**, no fake numbers.
+crash mid-run. Each experiment below isolates one failure mode and shows the fix —
+measured with **real AWS Bedrock calls**, no fake numbers. Open one from the sidebar
+and watch each arm stream its steps live.
         """
     )
 with col_b:
     st.markdown("### Quick facts")
-    st.metric("Experiments built", "5")
+    st.metric("Experiments built", "4")
     st.metric("Papers in corpus", "7")
     st.metric("Models", "Haiku 3.5 · Sonnet 4.6")
 
@@ -50,7 +54,7 @@ st.markdown("### Experiments — use the sidebar to navigate")
 EXPERIMENTS = [
     {
         "num": "1",
-        "title": "Progressive Disclosure",
+        "title": "Just-in-Time Retrieval",
         "emoji": "🔭",
         "problem": "Loading all 7 papers upfront fills the context with irrelevant text and hurts answer accuracy.",
         "fix": "Agent reads a lightweight index first, then fetches only the one relevant paper on demand.",
@@ -58,14 +62,6 @@ EXPERIMENTS = [
     },
     {
         "num": "2",
-        "title": "Context Rot",
-        "emoji": "🦠",
-        "problem": "Each agent-loop iteration appends a tool output. Context grows unbounded; the model starts missing earlier facts.",
-        "fix": "Truncate documents after reading; clear tool outputs between iterations. Context stays flat.",
-        "metric": "Tokens held steady vs unbounded growth",
-    },
-    {
-        "num": "3",
         "title": "Compaction",
         "emoji": "🗜️",
         "problem": "Some tasks need their full history — you can't just truncate. Growth eventually overflows and the task dies.",
@@ -73,7 +69,7 @@ EXPERIMENTS = [
         "metric": "Task completes vs crashes mid-way",
     },
     {
-        "num": "4",
+        "num": "3",
         "title": "External Memory",
         "emoji": "🗂️",
         "problem": "LLMs are stateless. A new session starts blank — all earlier work is gone.",
@@ -81,12 +77,12 @@ EXPERIMENTS = [
         "metric": "4/4 papers covered vs ~2/4 naive",
     },
     {
-        "num": "5",
+        "num": "4",
         "title": "Multi-Agent",
         "emoji": "🕸️",
         "problem": "One agent loading 4 papers for a multi-part task bloats context to ~80k tokens.",
         "fix": "3 isolated specialist sub-agents each work in their own window; orchestrator sees only 3 summaries.",
-        "metric": "27× context compression · specialists run in parallel",
+        "metric": "~27× context compression · specialists run in parallel",
     },
 ]
 
